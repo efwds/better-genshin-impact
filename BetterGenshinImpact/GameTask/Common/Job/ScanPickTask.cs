@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using BetterGenshinImpact.Core.Recognition.ONNX;
 using BetterGenshinImpact.Core.Simulator.Extensions;
+using BetterGenshinImpact.GameTask.AutoPick.Assets;
 using BetterGenshinImpact.GameTask.Model.Area;
 using BetterGenshinImpact.GameTask.Runtime;
 using Microsoft.Extensions.DependencyInjection;
@@ -125,7 +126,10 @@ public class ScanPickTask
             MoveTowardsItem(toPickItem);
 
             await _runtime.Delay(200, ct);
-            InputHub.Foreground.SimulateAction(GIActions.Drop);
+            // 自动战斗任务期间自动拾取触发器可能未启用，因此扫描靠近掉落物后直接按配置的拾取键。
+            using var pickCapture = _runtime.CaptureToRectArea();
+            var pickKey = AutoPickAssets.Get(pickCapture, _config.AutoPickConfig.PickKey).PickVk;
+            InputHub.Foreground.Keyboard.KeyPress(pickKey);
         }
         Logger.LogInformation("超时或视野内没有可拾取物品，结束扫描");
         InputHub.ReleaseAll();
