@@ -16,6 +16,10 @@
 		<DebugType>embedded</DebugType>
 	</PropertyGroup>
 
+	<ItemGroup Condition="'$(ForkUpdateRepository)' != ''">
+		<AssemblyMetadata Include="ForkUpdateRepository" Value="$(ForkUpdateRepository)" />
+	</ItemGroup>
+
 <!--	<ItemGroup>
 		<None Remove="Assets\Images\*.jpg" />
 		<None Remove="Assets\Images\*" />

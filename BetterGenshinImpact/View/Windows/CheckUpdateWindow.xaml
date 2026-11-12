@@ -58,7 +58,7 @@
                             <ui:TextBlock Grid.Row="1"
                                           Grid.Column="0"
                                           Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
-                                          Text="{Binding GitSourceDescription}"
+                                          Text="{Binding GitSourceDescription, Mode=OneWay}"
                                           TextWrapping="Wrap" />
                         </Grid>
                     </ui:CardControl.Header>
@@ -106,7 +106,7 @@
                             Command="{Binding UpdateFromSteambirdCommand}" />
                     </StackPanel>
                 </ui:CardControl>
-                <ui:CardControl Margin="0,0,0,4" Padding="12,12">
+                <ui:CardControl Name="MirrorChyanCard" Margin="0,0,0,4" Padding="12,12">
                     <ui:CardControl.Icon>
                         <ui:FontIcon Glyph="&#xf0c2;" Style="{StaticResource FaFontIconStyle}" />
                     </ui:CardControl.Icon>
