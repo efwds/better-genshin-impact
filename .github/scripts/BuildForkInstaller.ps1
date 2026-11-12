@@ -12,11 +12,12 @@ $output = (New-Item -ItemType Directory -Path $OutputDirectory -Force).FullName
 $app = Join-Path $output 'BetterGI'
 
 # 用上游正式版本号发布自包含应用，并写入 fork 的更新仓库。
-dotnet publish (Join-Path $repoRoot 'BetterGenshinImpact/BetterGenshinImpact.csproj') -c Release -p:Platform=x64 -p:PublishProfile=FolderProfile "-p:Version=$Version" "-p:ForkUpdateRepository=$Repository" -o $app
+dotnet publish (Join-Path $repoRoot 'BetterGenshinImpact/BetterGenshinImpact.csproj') -c Release -p:Platform=x64 -p:PublishProfile=FolderProfile "-p:Version=$Version" "-p:ForkUpdateRepository=$Repository" -o $app -nologo -tl:off -clp:ErrorsOnly
 $appVersion = (Get-Item -LiteralPath (Join-Path $app 'BetterGI.exe')).VersionInfo.ProductVersion
 if ($appVersion -cne $Version) { throw "Unexpected BetterGI version: $appVersion." }
 $assemblyInfo = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'BetterGenshinImpact/obj/x64/Release') -Filter '*.AssemblyInfo.cs' -File -Recurse
-if (-not ($assemblyInfo | Select-String -SimpleMatch "AssemblyMetadataAttribute(`"ForkUpdateRepository`", `"$Repository`")")) {
+$metadataPattern = 'AssemblyMetadata(?:Attribute)?\(\s*"ForkUpdateRepository"\s*,\s*"' + [regex]::Escape($Repository) + '"\s*\)'
+if (-not ($assemblyInfo | Select-String -Pattern $metadataPattern)) {
     throw 'The fork update repository was not written to the assembly.'
 }
 
