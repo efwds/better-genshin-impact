@@ -1,0 +1,108 @@
+name: Merge and build upstream BetterGI releases
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bettergi-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  merge-and-build:
+    if: github.repository == 'efwds/better-genshin-impact' && github.ref_name == 'codex/continuous-targeting-dpi'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the fork branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check upstream release and merge locally
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh api repos/babalae/better-genshin-impact/releases/latest --jq .tag_name
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tag)) {
+              throw 'Could not read the latest stable BetterGI release.'
+          }
+
+          $tagRef = "refs/tags/$tag"
+          git check-ref-format $tagRef
+          if ($LASTEXITCODE -ne 0) { throw 'The release tag is not a valid Git ref.' }
+
+          git fetch --no-tags https://github.com/babalae/better-genshin-impact.git $tagRef
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream release $tag." }
+          $commit = git rev-parse 'FETCH_HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve upstream release $tag." }
+
+          "Upstream release: $tag ($commit)" >> $env:GITHUB_STEP_SUMMARY
+          "release_sha=$commit" >> $env:GITHUB_OUTPUT
+
+          git merge-base --is-ancestor $commit HEAD
+          switch ($LASTEXITCODE) {
+              0 {
+                  'The upstream release is already included.' >> $env:GITHUB_STEP_SUMMARY
+                  $build = $env:GITHUB_EVENT_NAME -eq 'workflow_dispatch'
+                  "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+                  'push=false' >> $env:GITHUB_OUTPUT
+                  exit 0
+              }
+              1 { }
+              default { throw "Could not compare the fork with release $tag." }
+          }
+
+          git -c 'user.name=github-actions[bot]' -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' merge --no-ff --no-edit -m "Merge upstream BetterGI release $tag" $commit
+          if ($LASTEXITCODE -ne 0) {
+              $conflicts = @(git -c core.quotePath=false diff --name-only --diff-filter=U)
+              if ($conflicts.Count -gt 0) {
+                  'Merge conflicts:' >> $env:GITHUB_STEP_SUMMARY
+                  $conflicts | ForEach-Object { "- $_" >> $env:GITHUB_STEP_SUMMARY }
+                  git merge --abort
+                  if ($LASTEXITCODE -ne 0) { throw 'Could not abort the conflicting merge.' }
+                  throw "Release $tag has conflicts. See the job summary."
+              }
+              throw "Could not merge upstream release $tag."
+          }
+
+          'build=true' >> $env:GITHUB_OUTPUT
+          'push=true' >> $env:GITHUB_OUTPUT
+
+      - name: Set up .NET 10
+        if: steps.release.outputs.build == 'true'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build BetterGI
+        if: steps.release.outputs.build == 'true'
+        shell: pwsh
+        run: dotnet msbuild BetterGenshinImpact.sln -restore -p:Configuration=Debug -nologo -tl:off -clp:ErrorsOnly
+
+      - name: Upload the Windows build
+        if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: BetterGI-Debug-${{ steps.release.outputs.release_sha }}
+          path: BetterGenshinImpact/bin/x64/Debug/*/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 14
+
+      - name: Push the verified merge
+        if: steps.release.outputs.push == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure GitHub authentication.' }
+          git push origin "HEAD:refs/heads/$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not push the verified merge.' }
