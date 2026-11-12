@@ -424,7 +424,7 @@ public static class AvatarRecognition
         CancellationToken ct,
         Func<bool>? isFightEnd = null)
     {
-        var dpi = runtime.SystemInfo.DpiScale;
+        // 截图偏差已经是物理像素，直接用于计算相对鼠标位移。
         // 资源缩放比例
         var assetScale = runtime.SystemInfo.AssetScale;
         var visConfig = GetVisualRecognitionConfig();
@@ -480,7 +480,7 @@ public static class AvatarRecognition
                         {
                             if (_skipSeekCount > 0) continue;
                             InputHub.Foreground.Mouse.MoveMouseBy(
-                                (int)(offsetX * 0.35 * dpi), (int)(offsetY * 0.25 * dpi));
+                                (int)(offsetX * 0.35), (int)(offsetY * 0.25));
                         }
 
                         // 叠加层：最近血条绿色粗框，其余红色细框
@@ -512,7 +512,7 @@ public static class AvatarRecognition
                             {
                                 if (_skipSeekCount > 0) continue;
                                 InputHub.Foreground.Mouse.MoveMouseBy(
-                                    (int)(offsetX * 0.35 * dpi), (int)(offsetY * 0.25 * dpi));
+                                    (int)(offsetX * 0.35), (int)(offsetY * 0.25));
                             }
 
                             // 叠加层：伤害数字区域绿色框
@@ -534,7 +534,7 @@ public static class AvatarRecognition
                                 lock (_seekLock)
                                 {
                                     if (_skipSeekCount > 0) continue;
-                                    InputHub.Foreground.Mouse.MoveMouseBy((int)(250 * dpi), 0);
+                                    InputHub.Foreground.Mouse.MoveMouseBy(250, 0);
                                 }
                             }
                         }
