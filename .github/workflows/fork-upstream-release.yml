@@ -15,7 +15,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 35
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      merge_sha: ${{ steps.release.outputs.merge_sha }}
     steps:
       - name: Check out the fork branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,12 +54,14 @@ jobs:
                   'The upstream release is already included.' >> $env:GITHUB_STEP_SUMMARY
                   $build = $env:GITHUB_EVENT_NAME -eq 'workflow_dispatch'
                   "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-                  'push=false' >> $env:GITHUB_OUTPUT
                   exit 0
               }
               1 { }
               default { throw "Could not compare the fork with release $tag." }
           }
+
+          $base = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the fork branch.' }
 
           git -c 'user.name=github-actions[bot]' -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' merge --no-ff --no-edit -m "Merge upstream BetterGI release $tag" $commit
           if ($LASTEXITCODE -ne 0) {
@@ -72,8 +76,12 @@ jobs:
               throw "Could not merge upstream release $tag."
           }
 
+          $merge = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the merge commit.' }
+          git bundle create "$env:RUNNER_TEMP/upstream-release.bundle" HEAD "^$base"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not bundle the merge commit.' }
           'build=true' >> $env:GITHUB_OUTPUT
-          'push=true' >> $env:GITHUB_OUTPUT
+          "merge_sha=$merge" >> $env:GITHUB_OUTPUT
 
       - name: Set up .NET 10
         if: steps.release.outputs.build == 'true'
@@ -96,13 +104,50 @@ jobs:
           compression-level: 1
           retention-days: 14
 
+      - name: Upload the verified merge commit
+        if: steps.release.outputs.merge_sha != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-release-merge
+          path: ${{ runner.temp }}/upstream-release.bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: merge-and-build
+    if: needs.merge-and-build.outputs.merge_sha != '' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the fork with its publishing key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.UPSTREAM_RELEASE_PUSH_KEY }}
+
+      - name: Download the verified merge commit
+        if: needs.merge-and-build.outputs.merge_sha != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-release-merge
+          path: ${{ runner.temp }}
+
       - name: Push the verified merge
-        if: steps.release.outputs.push == 'true'
-        shell: pwsh
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.merge-and-build.outputs.merge_sha }}
         run: |
-          gh auth setup-git
-          if ($LASTEXITCODE -ne 0) { throw 'Could not configure GitHub authentication.' }
-          git push origin "HEAD:refs/heads/$env:GITHUB_REF_NAME"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not push the verified merge.' }
+          if [[ -z "$MERGE_SHA" ]]; then
+            git push --dry-run origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+            exit 0
+          fi
+
+          git fetch "$RUNNER_TEMP/upstream-release.bundle" HEAD
+          verified_commit=$(git rev-parse FETCH_HEAD)
+          [[ "$verified_commit" == "$MERGE_SHA" ]]
+          git merge-base --is-ancestor HEAD "$verified_commit"
+          git push origin "$verified_commit:refs/heads/$GITHUB_REF_NAME"
