@@ -32,7 +32,9 @@ public partial class CheckUpdateWindow : FluentWindow
 
     [ObservableProperty] private string selectedGitSource = "CNB";
 
-    public string GitSourceDescription => SelectedGitSource == "CNB" ? "【国内】直接从 CNB 下载并更新" : "【国外】直接从 Github 下载并更新";
+    public string GitSourceDescription => _forkRepository is not null
+        ? $"从 {_forkRepository} 的 GitHub Release 下载并更新"
+        : SelectedGitSource == "CNB" ? "【国内】直接从 CNB 下载并更新" : "【国外】直接从 Github 下载并更新";
 
     partial void OnSelectedGitSourceChanged(string value)
     {
@@ -41,15 +43,19 @@ public partial class CheckUpdateWindow : FluentWindow
 
     private UpdateOption _option;
 
-    public CheckUpdateWindow(UpdateOption option)
+    /// <summary>当前构建指定的 GitHub 更新仓库。</summary>
+    private readonly string? _forkRepository;
+
+    public CheckUpdateWindow(UpdateOption option, string? forkRepository = null)
     {
         _option = option ?? throw new ArgumentNullException(nameof(option));
+        _forkRepository = forkRepository;
         DataContext = this;
         InitializeComponent();
         SourceInitialized += (s, e) => WindowHelper.TryApplySystemBackdrop(this);
 
         // 存在CDK则显示修改按钮
-        if (string.IsNullOrEmpty(MirrorChyanHelper.GetCdk()))
+        if (_forkRepository is not null || string.IsNullOrEmpty(MirrorChyanHelper.GetCdk()))
         {
             EditCdkButton.Visibility = Visibility.Collapsed;
         }
@@ -59,7 +65,13 @@ public partial class CheckUpdateWindow : FluentWindow
             IgnoreButton.Visibility = Visibility.Collapsed;
         }
 
-        if (option.Channel == UpdateChannel.Alpha)
+        if (_forkRepository is not null)
+        {
+            GitSourceComboBox.Visibility = Visibility.Collapsed;
+            SteambirdCard.Visibility = Visibility.Collapsed;
+            MirrorChyanCard.Visibility = Visibility.Collapsed;
+        }
+        else if (option.Channel == UpdateChannel.Alpha)
         {
             WebpagePanel.Height = 0;
             WebpagePanel.Visibility = Visibility.Collapsed;
@@ -78,7 +90,7 @@ public partial class CheckUpdateWindow : FluentWindow
         Closing += OnClosing;
 
         // 延迟显示气泡提示
-        if (option.Channel != UpdateChannel.Alpha)
+        if (_forkRepository is not null || option.Channel != UpdateChannel.Alpha)
         {
             var showTimer = new DispatcherTimer
             {
@@ -148,7 +160,7 @@ public partial class CheckUpdateWindow : FluentWindow
     [RelayCommand]
     private async Task UpdateFromGitHostPlatformAsync()
     {
-        string source = SelectedGitSource == "CNB" ? "cnb" : "github";
+        string source = _forkRepository is null && SelectedGitSource == "CNB" ? "cnb" : "github";
 
         if (source == "github")
         {

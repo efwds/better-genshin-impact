@@ -1,4 +1,4 @@
-﻿using BetterGenshinImpact.Core.Config;
+using BetterGenshinImpact.Core.Config;
 using BetterGenshinImpact.Helpers;
 using BetterGenshinImpact.Helpers.Http;
 using BetterGenshinImpact.Model;
@@ -6,6 +6,7 @@ using BetterGenshinImpact.Service.Interface;
 using BetterGenshinImpact.View.Windows;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -14,6 +15,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -31,6 +33,11 @@ public class UpdateService : IUpdateService
 
     private const string NoticeUrl = "https://hui-config.oss-cn-hangzhou.aliyuncs.com/bgi/notice.json";
     private const string DownloadPageUrl = "https://www.bettergi.com/download.html";
+
+    /// <summary>由 fork 发布构建写入的 GitHub 更新仓库。</summary>
+    private static readonly string? ForkUpdateRepository = typeof(UpdateService).Assembly
+        .GetCustomAttributes<AssemblyMetadataAttribute>()
+        .FirstOrDefault(attribute => attribute.Key == "ForkUpdateRepository")?.Value;
 
     public AllConfig Config { get; set; }
 
@@ -53,7 +60,10 @@ public class UpdateService : IUpdateService
 #if DEBUG && false
             return;
 #endif
-            string newVersion = await GetLatestVersionAsync(option);
+            var forkRelease = ForkUpdateRepository is null ? null : await GetForkReleaseAsync(ForkUpdateRepository);
+            string newVersion = ForkUpdateRepository is null
+                ? await GetLatestVersionAsync(option)
+                : forkRelease?.Value<string>("tag_name") ?? string.Empty;
 
             if (string.IsNullOrWhiteSpace(newVersion))
             {
@@ -64,7 +74,7 @@ public class UpdateService : IUpdateService
             // 方便调试窗口
             if (RuntimeHelper.IsDebuggerAttached && option.Trigger == UpdateTrigger.Manual)
             {
-                await OpenCheckUpdateWindow(option, newVersion);
+                await OpenCheckUpdateWindow(option, newVersion, forkRelease);
                 return;
             }
             // ---- 如果是调试模式且手动的检查更新的情况下，强制打开更新窗口 -----
@@ -86,7 +96,7 @@ public class UpdateService : IUpdateService
                 return;
             }
 
-            await OpenCheckUpdateWindow(option, newVersion);
+            await OpenCheckUpdateWindow(option, newVersion, forkRelease);
         }
         catch (Exception e)
         {
@@ -96,9 +106,9 @@ public class UpdateService : IUpdateService
         }
     }
 
-    private async Task OpenCheckUpdateWindow(UpdateOption option, string newVersion)
+    private async Task OpenCheckUpdateWindow(UpdateOption option, string newVersion, JObject? forkRelease)
     {
-        CheckUpdateWindow win = new(option)
+        CheckUpdateWindow win = new(option, ForkUpdateRepository)
         {
             Owner = Application.Current.MainWindow,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
@@ -114,7 +124,12 @@ public class UpdateService : IUpdateService
                         break;
 
                     case CheckUpdateWindow.CheckUpdateWindowButton.OtherUpdate:
-                        if (option.Channel == UpdateChannel.Stable)
+                        if (ForkUpdateRepository is not null)
+                        {
+                            var releaseUrl = $"https://github.com/{ForkUpdateRepository}/releases/tag/{Uri.EscapeDataString(newVersion)}";
+                            Process.Start(new ProcessStartInfo(releaseUrl) { UseShellExecute = true });
+                        }
+                        else if (option.Channel == UpdateChannel.Stable)
                         {
                             Process.Start(new ProcessStartInfo(DownloadPageUrl) { UseShellExecute = true });
                         }
@@ -135,7 +150,7 @@ public class UpdateService : IUpdateService
                         }
 
                         // 启动
-                        Process.Start(updaterExePath, "-I");
+                        Process.Start(updaterExePath, ForkUpdateRepository is null ? "-I" : "-I --source github");
 
                         // 退出程序
                         Application.Current.Shutdown();
@@ -155,12 +170,33 @@ public class UpdateService : IUpdateService
             }
         };
 
-        if (option.Channel == UpdateChannel.Stable)
+        if (forkRelease is not null || option.Channel == UpdateChannel.Stable)
         {
-            win.NavigateToHtml(await GetReleaseMarkdownHtmlAsync());
+            win.NavigateToHtml(await GetReleaseMarkdownHtmlAsync(forkRelease));
         }
 
         win.ShowDialog();
+    }
+
+    /// <summary>读取 fork 最新正式 Release，只有安装包已上传时才提示更新。</summary>
+    private static async Task<JObject?> GetForkReleaseAsync(string repository)
+    {
+        using HttpClient httpClient = new();
+        httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("BetterGI");
+        using var response = await httpClient.GetAsync($"https://api.github.com/repos/{repository}/releases/latest");
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        var release = JObject.Parse(await response.Content.ReadAsStringAsync());
+        var version = release.Value<string>("tag_name");
+        var installerName = $"BetterGI.Install.{version}.exe";
+        return !string.IsNullOrWhiteSpace(version) && release["assets"]?.Any(asset =>
+            asset.Value<string>("name") == installerName && asset.Value<string>("state") == "uploaded") == true
+            ? release
+            : null;
     }
 
     private async Task<string> GetLatestVersionAsync(UpdateOption option)
@@ -293,21 +329,19 @@ public class UpdateService : IUpdateService
         return string.Empty;
     }
 
-    private async Task<string> GetReleaseMarkdownHtmlAsync()
+    private async Task<string> GetReleaseMarkdownHtmlAsync(JObject? forkRelease)
     {
         try
         {
             using HttpClient httpClient = new();
             httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-            string jsonString =
-                await httpClient.GetStringAsync(
-                    "https://api.github.com/repos/babalae/better-genshin-impact/releases/latest");
-            var jsonDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(jsonString);
+            var release = forkRelease ?? JObject.Parse(await httpClient.GetStringAsync(
+                "https://api.github.com/repos/babalae/better-genshin-impact/releases/latest"));
 
-            if (jsonDict != null)
+            if (release.HasValues)
             {
-                string? name = jsonDict["name"] as string;
-                string? body = jsonDict["body"] as string;
+                string? name = release.Value<string>("name");
+                string? body = release.Value<string>("body");
                 string md = $"# {name}{new string('\n', 2)}{body}";
 
                 md = WebUtility.HtmlEncode(md);

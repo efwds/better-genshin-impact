@@ -1,0 +1,240 @@
+name: Merge, build and publish BetterGI fork releases
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Fork release version, for example 0.67.1; leave blank to use the upstream version'
+        required: false
+        type: string
+
+concurrency:
+  group: bettergi-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  merge-and-build:
+    if: github.repository == 'efwds/better-genshin-impact' && github.ref_name == 'codex/main-based-fork'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      merge_sha: ${{ steps.release.outputs.merge_sha }}
+      package: ${{ steps.release.outputs.package }}
+      version: ${{ steps.release.outputs.version }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+    steps:
+      - name: Check out the fork branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check upstream release and merge locally
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          $tag = gh api repos/babalae/better-genshin-impact/releases/latest --jq .tag_name
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tag)) {
+              throw 'Could not read the latest stable BetterGI release.'
+          }
+          if ($tag -cnotmatch '^v?([0-9]+\.[0-9]+\.[0-9]+)$') {
+              throw "Unsupported stable release tag: $tag."
+          }
+          $upstreamVersion = $Matches[1]
+          $version = $upstreamVersion
+          if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+              $version = $env:RELEASE_VERSION.Trim()
+              if ($version -cnotmatch '^v?([0-9]+\.[0-9]+\.[0-9]+)$') {
+                  throw "Unsupported fork release version: $version."
+              }
+              $version = $Matches[1]
+          }
+          $publishedTags = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read existing fork releases.' }
+          $publishedVersions = @($publishedTags | ForEach-Object { $_ -replace '^v', '' })
+          $package = $version -cnotin $publishedVersions
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "upstream_tag=$tag" >> $env:GITHUB_OUTPUT
+          "package=$($package.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          $tagRef = "refs/tags/$tag"
+          git check-ref-format $tagRef
+          if ($LASTEXITCODE -ne 0) { throw 'The release tag is not a valid Git ref.' }
+
+          git fetch --no-tags https://github.com/babalae/better-genshin-impact.git $tagRef
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream release $tag." }
+          $tagCommit = git rev-parse 'FETCH_HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve upstream release $tag." }
+
+          git fetch --no-tags https://github.com/babalae/better-genshin-impact.git refs/heads/main
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch upstream main.' }
+          $mainCommit = git rev-parse 'FETCH_HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve upstream main.' }
+          $commit = git merge-base $tagCommit $mainCommit
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) {
+              throw "Could not find the main-line source for upstream release $tag."
+          }
+
+          "Upstream release: $tag ($tagCommit)" >> $env:GITHUB_STEP_SUMMARY
+          "Upstream main source: $commit" >> $env:GITHUB_STEP_SUMMARY
+          git merge-base --is-ancestor $commit HEAD
+          switch ($LASTEXITCODE) {
+              0 {
+                  'The upstream main source is already included.' >> $env:GITHUB_STEP_SUMMARY
+                  $build = $package -or $env:GITHUB_EVENT_NAME -eq 'workflow_dispatch'
+                  "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+                  exit 0
+              }
+              1 { }
+              default { throw "Could not compare the fork with main source for release $tag." }
+          }
+
+          $base = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the fork branch.' }
+
+          git -c 'user.name=github-actions[bot]' -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' merge --no-ff --no-edit -m "Merge upstream BetterGI main source for $tag" $commit
+          if ($LASTEXITCODE -ne 0) {
+              $conflicts = @(git -c core.quotePath=false diff --name-only --diff-filter=U)
+              if ($conflicts.Count -gt 0) {
+                  'Merge conflicts:' >> $env:GITHUB_STEP_SUMMARY
+                  $conflicts | ForEach-Object { "- $_" >> $env:GITHUB_STEP_SUMMARY }
+                  git merge --abort
+                  if ($LASTEXITCODE -ne 0) { throw 'Could not abort the conflicting merge.' }
+              throw "Main source for release $tag has conflicts. See the job summary."
+              }
+              throw "Could not merge upstream release $tag."
+          }
+
+          $merge = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the merge commit.' }
+          git bundle create "$env:RUNNER_TEMP/upstream-release.bundle" HEAD "^$base"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not bundle the merge commit.' }
+          'build=true' >> $env:GITHUB_OUTPUT
+          "merge_sha=$merge" >> $env:GITHUB_OUTPUT
+
+      - name: Set up .NET 8
+        if: steps.release.outputs.build == 'true'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build BetterGI
+        if: steps.release.outputs.build == 'true'
+        shell: pwsh
+        run: dotnet msbuild BetterGenshinImpact.sln -restore -p:Configuration=Debug -nologo -tl:off -clp:ErrorsOnly
+
+      - name: Build and verify the fork installer
+        if: steps.release.outputs.package == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          ./.github/scripts/BuildForkInstaller.ps1 -Repository $env:GITHUB_REPOSITORY -UpstreamTag $env:UPSTREAM_TAG -Version $env:RELEASE_VERSION -OutputDirectory "$env:RUNNER_TEMP/fork-package"
+
+      - name: Upload the verified installer
+        if: steps.release.outputs.package == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-installer
+          path: ${{ runner.temp }}/fork-package/BetterGI.Install.${{ steps.release.outputs.version }}.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload the verified merge commit
+        if: steps.release.outputs.merge_sha != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-release-merge
+          path: ${{ runner.temp }}/upstream-release.bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: merge-and-build
+    if: needs.merge-and-build.outputs.merge_sha != '' || needs.merge-and-build.outputs.package == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the fork with its publishing key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.UPSTREAM_RELEASE_PUSH_KEY }}
+
+      - name: Download the verified merge commit
+        if: needs.merge-and-build.outputs.merge_sha != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-release-merge
+          path: ${{ runner.temp }}
+
+      - name: Push the verified merge
+        id: merge
+        shell: bash
+        env:
+          MERGE_SHA: ${{ needs.merge-and-build.outputs.merge_sha }}
+        run: |
+          if [[ -z "$MERGE_SHA" ]]; then
+            git push --dry-run origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch "$RUNNER_TEMP/upstream-release.bundle" HEAD
+          verified_commit=$(git rev-parse FETCH_HEAD)
+          [[ "$verified_commit" == "$MERGE_SHA" ]]
+          git merge-base --is-ancestor HEAD "$verified_commit"
+          git push origin "$verified_commit:refs/heads/$GITHUB_REF_NAME"
+          echo "commit=$verified_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Download the verified installer
+        if: needs.merge-and-build.outputs.package == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fork-installer
+          path: ${{ runner.temp }}
+
+      - name: Publish the fork release
+        if: needs.merge-and-build.outputs.package == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.merge-and-build.outputs.version }}
+          UPSTREAM_TAG: ${{ needs.merge-and-build.outputs.upstream_tag }}
+          VERIFIED_COMMIT: ${{ steps.merge.outputs.commit }}
+        run: |
+          asset="$RUNNER_TEMP/BetterGI.Install.$VERSION.exe"
+          test -s "$asset"
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft)
+          draft=$(jq -r --arg version "$VERSION" '.[] | select(.tagName == $version) | .isDraft' <<< "$releases")
+          if [[ "$draft" == 'false' ]]; then
+            echo "Release $VERSION is already published."
+            exit 0
+          fi
+          if [[ "$draft" == 'true' ]]; then
+            target=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)
+            if [[ "$target" != "$VERIFIED_COMMIT" ]]; then
+              echo "::error::The existing draft for $VERSION targets a different commit."
+              exit 1
+            fi
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --draft --target "$VERIFIED_COMMIT" \
+              --title "BetterGI $VERSION (fork)" \
+              --notes "基于 [上游 $UPSTREAM_TAG](https://github.com/babalae/better-genshin-impact/releases/tag/$UPSTREAM_TAG) 的 main 源码构建，保留持续索敌 DPI 修复。软件更新来自本 fork 的 GitHub Release。"
+          fi
+          gh release upload "$VERSION" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
